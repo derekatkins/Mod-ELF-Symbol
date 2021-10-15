@@ -79,6 +79,10 @@ int writeall(int fd, char *addr, size_t size) {
 
 void read_metadata(char *file, char *addr, size_t size, off_t offset) {
   int fd = open(file, O_RDONLY);
+  if (fd == -1) {
+    perror("open");
+    exit(1);
+  };
   off_t rc = lseek(fd, offset, SEEK_SET);
   if (rc == (off_t)(-1)) {
     perror("lseek");
