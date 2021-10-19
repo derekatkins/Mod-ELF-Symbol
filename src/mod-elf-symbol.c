@@ -47,6 +47,16 @@ static int actualKeepNumSymbolsIndex = 0;
 static char *actualCompleteSymbolsToReplace[300] = {0};
 static int actualCompleteSymbolsIndex = 0;
 
+// Combined 32/64-bit Elf Header Structure
+typedef struct {
+  union {
+    Elf32_Ehdr elf32_ehdr;
+    Elf64_Ehdr elf64_ehdr;
+    unsigned char e_ident[EI_NIDENT];
+  } ehdr;
+  int elfclass;
+} Elf_Ehdr;
+
 // Future function implementations:
 int readInElfHeader();
 int readInSymbolTable();
@@ -281,19 +291,37 @@ void printSymbolsToChange(int count, char *list[], char *str, FLAGTYPE ft) {
   }
 }
 
-int checkAndFindElfFile(char *objFileName, Elf64_Ehdr *ehdr) {
+int checkAndFindElfFile(char *objFileName, Elf_Ehdr *ehdr) {
   if (debug_func)
     printf("checkAndFindElfFile\n");
 
-  read_metadata(objFileName, (char *)ehdr, sizeof(Elf64_Ehdr), 0);
+  read_metadata(objFileName, (char *)ehdr, EI_NIDENT, 0);
 
-  if (ehdr->e_ident[EI_MAG0] != 0x7f &&
-      ehdr->e_ident[EI_MAG1] != 'E' && // CHECK IF ELF
-      ehdr->e_ident[EI_MAG2] != 'L' && ehdr->e_ident[EI_MAG3] != 'F') {
+  if (ehdr->ehdr.e_ident[EI_MAG0] != 0x7f &&
+      ehdr->ehdr.e_ident[EI_MAG1] != 'E' && // CHECK IF ELF
+      ehdr->ehdr.e_ident[EI_MAG2] != 'L' && ehdr->ehdr.e_ident[EI_MAG3] != 'F') {
     printf("Not an ELF executable\n");
     return -1;
   }
-  switch (ehdr->e_type) {
+  ehdr->elfclass = ehdr->ehdr.e_ident[EI_CLASS];
+  if (ehdr->ehdr.e_ident[EI_DATA] != ELFDATA2LSB) {
+    printf("Not LSB Data\n");
+    return -1;
+  }
+  // Now read the rest of the header based on ELFCLASS32 or ELFCLASS64
+  switch (ehdr->elfclass) {
+  case ELFCLASS32:
+    read_metadata(objFileName, (char *)ehdr, sizeof(Elf32_Ehdr), 0);
+    break;
+  case ELFCLASS64:
+    read_metadata(objFileName, (char *)ehdr, sizeof(Elf64_Ehdr), 0);
+    break;
+  default:
+    printf("Unknown ELF Class\n");
+    return -1;
+  }
+  // Note: the e_type has the same offset for 32 and 64 Elf Headers
+  switch (ehdr->ehdr.elf64_ehdr.e_type) {
   case ET_EXEC:
     printf("WARNING: The ELf type is that of an executable. (%s)\n",
            objFileName);
@@ -413,11 +441,8 @@ int main(int argc, char **argv) {
   printf("\n\n");
 
   for (int i = 0; i < objIndex; ++i) {
-    Elf64_Shdr *shdr = NULL;
-    Elf64_Shdr *symtab = NULL;
-    Elf64_Shdr *strtab = NULL;
     unsigned long prev_strtab_size = 0;
-    Elf64_Ehdr ehdr;
+    Elf_Ehdr ehdr;
 
     memset(actualSingleSymbolsToReplace, 0,
            sizeof(actualSingleSymbolsToReplace));
@@ -432,61 +457,142 @@ int main(int argc, char **argv) {
     // Check if file is valid and read in the ELF header
     assert(checkAndFindElfFile(objList[i], &ehdr) != -1);
 
-    // Find symbol table and string table
-    //   - shdr = malloc(); <-- on heap
-    assert(findSymtabAndStrtabAndShdr(objList[i], ehdr, &shdr, &symtab,
-                                      &strtab) != -1);
-    prev_strtab_size = strtab->sh_size;
+    /************************************************************/
+    if (ehdr.elfclass == ELFCLASS64) {
+      // Find symbol table and string table
+      //   - shdr = malloc(); <-- on heap
+      Elf64_Shdr *shdr = NULL;
+      Elf64_Shdr *symtab = NULL;
+      Elf64_Shdr *strtab = NULL;
+      assert(findSymtabAndStrtabAndShdr_Elf64(objList[i], ehdr.ehdr.elf64_ehdr,
+					      &shdr, &symtab, &strtab) != -1);
+      prev_strtab_size = strtab->sh_size;
 
-    // Check if the symbols exist first..
-    int symcount = 0;
-    assert(checkIfSymbolsExist(objList[i], singleSymbolIndex, singleSymbolList,
-                               keepNumSymbolIndex, keepNumSymbolList,
-                               completeSymbolIndex, completeSymbolList, symtab,
-                               strtab, &symcount) != -1);
-    if (!symcount) {
-      printf("        ^ ^ ^ continue\n\n");
-      free(shdr);
-      continue;
-    }
+      // Check if the symbols exist first..
+      int symcount = 0;
+      assert(checkIfSymbolsExist_Elf64(objList[i], singleSymbolIndex,
+				       singleSymbolList,
+				       keepNumSymbolIndex, keepNumSymbolList,
+				       completeSymbolIndex, completeSymbolList,
+				       symtab, strtab, &symcount) != -1);
+      if (!symcount) {
+	printf("        ^ ^ ^ continue\n\n");
+	free(shdr);
+	continue;
+      }
 
-    // Extend the string table and whatever follows after..
-    // Fix Elf header and Section header Table
-    int add_space = calculateBytesNeeded(actualSingleSymbolsIndex,
-                                         actualSingleSymbolsToReplace,
-                                         singleStr, SINGLESYM) +
-                    calculateBytesNeeded(actualKeepNumSymbolsIndex,
-                                         actualKeepNumSymbolsToReplace,
-                                         keepNumStr, KEEPNUMSYM) +
-                    calculateBytesNeeded(actualCompleteSymbolsIndex,
-                                         actualCompleteSymbolsToReplace,
-                                         completeStr, COMPLETESYM);
-    if (debug)
-      printf("ADD_SPACE is: %x\n", add_space);
-    assert(extendAndFixAfterStrtab(objList[i], &ehdr, &shdr, &symtab, &strtab,
-                                   add_space) != -1);
+      // Extend the string table and whatever follows after..
+      // Fix Elf header and Section header Table
+      int add_space = calculateBytesNeeded(actualSingleSymbolsIndex,
+					   actualSingleSymbolsToReplace,
+					   singleStr, SINGLESYM) +
+                      calculateBytesNeeded(actualKeepNumSymbolsIndex,
+					   actualKeepNumSymbolsToReplace,
+					   keepNumStr, KEEPNUMSYM) +
+                      calculateBytesNeeded(actualCompleteSymbolsIndex,
+					   actualCompleteSymbolsToReplace,
+					   completeStr, COMPLETESYM);
+      if (debug)
+	printf("ADD_SPACE is: %x\n", add_space);
+      assert(extendAndFixAfterStrtab_Elf64(objList[i], &(ehdr.ehdr.elf64_ehdr),
+					   &shdr, &symtab, &strtab,
+					   add_space) != -1);
 
-    // Add dmtcp symbol name(s) and update symtab
-    assert(addSymbolsAndUpdateSymtab(objList[i], i, actualSingleSymbolsIndex,
-                                     actualSingleSymbolsToReplace, symtab,
+      // Add dmtcp symbol name(s) and update symtab
+      assert(addSymbolsAndUpdateSymtab_Elf64(objList[i], i,
+				     actualSingleSymbolsIndex,
+				     actualSingleSymbolsToReplace, symtab,
                                      strtab, &prev_strtab_size, singleStr,
                                      SINGLESYM) != -1);
-    assert(addSymbolsAndUpdateSymtab(objList[i], i, actualKeepNumSymbolsIndex,
+      assert(addSymbolsAndUpdateSymtab_Elf64(objList[i], i,
+				     actualKeepNumSymbolsIndex,
                                      actualKeepNumSymbolsToReplace, symtab,
                                      strtab, &prev_strtab_size, keepNumStr,
                                      KEEPNUMSYM) != -1);
-    assert(addSymbolsAndUpdateSymtab(objList[i], i, actualCompleteSymbolsIndex,
+      assert(addSymbolsAndUpdateSymtab_Elf64(objList[i], i,
+				     actualCompleteSymbolsIndex,
                                      actualCompleteSymbolsToReplace, symtab,
                                      strtab, &prev_strtab_size, completeStr,
                                      COMPLETESYM) != -1);
 
-    for (int tmp_i = 0; tmp_i < actualSingleSymbolsIndex; ++tmp_i)
-      free(actualSingleSymbolsToReplace[tmp_i]);
-    for (int tmp_i = 0; tmp_i < actualKeepNumSymbolsIndex; ++tmp_i)
-      free(actualKeepNumSymbolsToReplace[tmp_i]);
-    for (int tmp_i = 0; tmp_i < actualCompleteSymbolsIndex; ++tmp_i)
-      free(actualCompleteSymbolsToReplace[tmp_i]);
-    free(shdr);
+      for (int tmp_i = 0; tmp_i < actualSingleSymbolsIndex; ++tmp_i)
+	free(actualSingleSymbolsToReplace[tmp_i]);
+      for (int tmp_i = 0; tmp_i < actualKeepNumSymbolsIndex; ++tmp_i)
+	free(actualKeepNumSymbolsToReplace[tmp_i]);
+      for (int tmp_i = 0; tmp_i < actualCompleteSymbolsIndex; ++tmp_i)
+	free(actualCompleteSymbolsToReplace[tmp_i]);
+      free(shdr);
+
+
+    /************************************************************/
+    } else if (ehdr.elfclass == ELFCLASS32) {
+      // Find symbol table and string table
+      //   - shdr = malloc(); <-- on heap
+      Elf32_Shdr *shdr = NULL;
+      Elf32_Shdr *symtab = NULL;
+      Elf32_Shdr *strtab = NULL;
+      assert(findSymtabAndStrtabAndShdr_Elf32(objList[i], ehdr.ehdr.elf32_ehdr,
+					      &shdr, &symtab, &strtab) != -1);
+      prev_strtab_size = strtab->sh_size;
+
+      // Check if the symbols exist first..
+      int symcount = 0;
+      assert(checkIfSymbolsExist_Elf32(objList[i], singleSymbolIndex,
+				       singleSymbolList,
+				       keepNumSymbolIndex, keepNumSymbolList,
+				       completeSymbolIndex, completeSymbolList,
+				       symtab, strtab, &symcount) != -1);
+      if (!symcount) {
+	printf("        ^ ^ ^ continue\n\n");
+	free(shdr);
+	continue;
+      }
+
+      // Extend the string table and whatever follows after..
+      // Fix Elf header and Section header Table
+      int add_space = calculateBytesNeeded(actualSingleSymbolsIndex,
+					   actualSingleSymbolsToReplace,
+					   singleStr, SINGLESYM) +
+                      calculateBytesNeeded(actualKeepNumSymbolsIndex,
+					   actualKeepNumSymbolsToReplace,
+					   keepNumStr, KEEPNUMSYM) +
+                      calculateBytesNeeded(actualCompleteSymbolsIndex,
+					   actualCompleteSymbolsToReplace,
+					   completeStr, COMPLETESYM);
+      if (debug)
+	printf("ADD_SPACE is: %x\n", add_space);
+      assert(extendAndFixAfterStrtab_Elf32(objList[i], &(ehdr.ehdr.elf32_ehdr),
+					   &shdr, &symtab, &strtab,
+					   add_space) != -1);
+
+      // Add dmtcp symbol name(s) and update symtab
+      assert(addSymbolsAndUpdateSymtab_Elf32(objList[i], i,
+				     actualSingleSymbolsIndex,
+				     actualSingleSymbolsToReplace, symtab,
+                                     strtab, &prev_strtab_size, singleStr,
+                                     SINGLESYM) != -1);
+      assert(addSymbolsAndUpdateSymtab_Elf32(objList[i], i,
+				     actualKeepNumSymbolsIndex,
+                                     actualKeepNumSymbolsToReplace, symtab,
+                                     strtab, &prev_strtab_size, keepNumStr,
+                                     KEEPNUMSYM) != -1);
+      assert(addSymbolsAndUpdateSymtab_Elf32(objList[i], i,
+				     actualCompleteSymbolsIndex,
+                                     actualCompleteSymbolsToReplace, symtab,
+                                     strtab, &prev_strtab_size, completeStr,
+                                     COMPLETESYM) != -1);
+
+      for (int tmp_i = 0; tmp_i < actualSingleSymbolsIndex; ++tmp_i)
+	free(actualSingleSymbolsToReplace[tmp_i]);
+      for (int tmp_i = 0; tmp_i < actualKeepNumSymbolsIndex; ++tmp_i)
+	free(actualKeepNumSymbolsToReplace[tmp_i]);
+      for (int tmp_i = 0; tmp_i < actualCompleteSymbolsIndex; ++tmp_i)
+	free(actualCompleteSymbolsToReplace[tmp_i]);
+      free(shdr);
+    } else {
+      printf("ERROR: Unknown ELF Class");
+      exit(1);
+    }
   }
   free(singleSymbolList);
   free(keepNumSymbolList);
