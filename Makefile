@@ -34,3 +34,5 @@ run_number: default readelf
 
 clean:
 	rm -rf *.o ./src/*.o $(MES) a.out
+
+${SDIR}/mod-elf-symbol.o: ${SDIR}/elfops.c
